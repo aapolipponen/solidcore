@@ -50,6 +50,9 @@
 //! | `p3::FilletCorner::adjust_topology` / `adjust_tangent_corner` (`_` arms) | `SmFilletCorner::AdjustTopology`, `SmFillet4x3Corner::AdjustTopology`, `SmFilletNxNCorner::AdjustTopology`, `SmFilletCorner::AdjustTangentCorner` (all `return SM_SUCCESS`) |
 //!
 //! Deviations:
+//! - **Eased corner boundaries (#1386).** With `ease_dist > 0`, N-sided faces
+//!   keep each face curve's exact parameter-midpoint halves instead of the fitted
+//!   surface isocurves. Ease zero retains the pinned construction.
 //! - **Shared helpers.** `sm_CheckSeamOut` and `sm_SetSurfaceClosure` are textually the
 //!   same in `SmFilletCorner.cpp` and `SmFilletGeom.cpp` (each file has its own static
 //!   copy): both are the ports in [`crate::blend::fillet_geom::p1`], re-exported here.
@@ -2262,6 +2265,11 @@ impl FilletCorner {
                 let iso_curve = surface
                     .create_iso_parametric_curve(env.k, param, iso, 0.0, None, false)?
                     .curve;
+                let iso_curve = if self.ease_dist > 0.0 {
+                    face_curve_half_along(self, env, &iso_curve)?.unwrap_or(iso_curve)
+                } else {
+                    iso_curve
+                };
                 curves_3d.push(iso_curve);
                 curve_orients.push(orient);
             }
@@ -2926,6 +2934,46 @@ fn loop_orientation(
     } else {
         OrientType::Same
     })
+}
+
+/// Retain an eased face curve's own half instead of the fitted patch isocurve.
+fn face_curve_half_along(
+    corner: &FilletCorner,
+    env: &CornerPatchEnv<'_, '_>,
+    iso: &Curve,
+) -> Result<Option<Curve>> {
+    let interval = iso.natural_interval();
+    let start = iso.evaluate_point(env.k, interval.min())?;
+    let end = iso.evaluate_point(env.k, interval.max())?;
+    let tol = corner.approx_tol_3d;
+    for &edge in &corner.edges {
+        if env.pseudo.fillet_edge(edge)?.fillet_edge_type() != FilletEdgeType::RailRailInterpolation
+        {
+            continue;
+        }
+        let Some(curve) = env.pseudo.brep().edge(edge)?.curve.as_ref() else {
+            continue;
+        };
+        let mut first = curve.copy(env.k)?;
+        let ivl = first.natural_interval();
+        let second = first.create_by_split_curve(env.k, ivl.mid())?;
+        for mut half in [first, second] {
+            let ivl = half.natural_interval();
+            let a = half.evaluate_point(env.k, ivl.min())?;
+            let b = half.evaluate_point(env.k, ivl.max())?;
+            let same = a.distance(start) <= tol && b.distance(end) <= tol;
+            let reverse = b.distance(start) <= tol && a.distance(end) <= tol;
+            if !same && !reverse {
+                continue;
+            }
+            if !same {
+                half.reverse_parameterization(env.k, &ivl)?;
+            }
+            half.edit_parameterization(env.k, &interval)?;
+            return Ok(Some(half));
+        }
+    }
+    Ok(None)
 }
 
 /// `pFilletBrep->MakeFaceWithCurves(NULL, ...)`: a face on `surface` (its natural
